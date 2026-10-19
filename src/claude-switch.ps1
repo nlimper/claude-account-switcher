@@ -429,7 +429,6 @@ if (-not $liveProblem) {
         }
     }
 }
-$aesKey = Get-AesKey $root
 Write-Host "Fetching usage..." -ForegroundColor DarkGray
 
 for ($i = 0; $i -lt $list.Count; $i++) {
@@ -438,7 +437,9 @@ for ($i = 0; $i -lt $list.Count; $i++) {
         Write-Host ("  [{0}] {1} {2,-32}  snapshot unusable: {3}" -f ($i + 1), $mark, $list[$i].Email, $list[$i].Problem) -ForegroundColor Red
         continue
     }
-    $u = Get-UsageFromBlob $list[$i].Token $aesKey
+    # Each saved profile has its own Local State key; the live one cannot
+    # decrypt the token cache of an account saved from a cleared profile.
+    $u = Get-UsageFromBlob $list[$i].Token (Get-AesKey $list[$i].Profile)
     $usageStr = if ($u) { "  5h {0,3}% / 7d {1,3}% used" -f [int]$u.five_hour.utilization, [int]$u.seven_day.utilization } else { "  usage n/a" }
     Write-Host ("  [{0}] {1} {2,-32}{3}" -f ($i + 1), $mark, $list[$i].Email, $usageStr)
     $resetStr = Format-Resets $u
