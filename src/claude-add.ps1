@@ -221,8 +221,7 @@ Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
 
 # Detect the email of the account ACTUALLY logged in, by decrypting the app's
 # oauth:tokenCache and asking the OAuth profile endpoint. Guards against
-# snapshotting under a mistyped email or while the app is logged out (same
-# guard claude-code-add has). Returns:
+# snapshotting under a mistyped email or while the app is logged out. Returns:
 #   a string email  - positively identified
 #   'EMPTY'         - token cache decrypted fine but holds no token at all
 #                      (definitely logged out - never overridable)

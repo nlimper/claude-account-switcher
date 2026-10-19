@@ -1,56 +1,26 @@
 # Claude Account Switcher
 
-Switch between multiple **Anthropic Claude** accounts (e.g. several Pro/Max
-accounts you own). One install gives you **two switchers**:
+Switch the **Claude desktop app** (Windows) between multiple **Anthropic Claude**
+accounts you own (e.g. several Pro/Max accounts), with a Desktop shortcut and a
+5-hour / 7-day usage readout per account.
 
-- **Desktop app** *(Windows only)* — flip the **Claude desktop app** (claude.ai
-  chats) between accounts, with a Desktop shortcut and a usage readout.
-- **Claude Code CLI** *(Windows · macOS · Linux)* — flip **Claude Code**
-  (`claude`) between accounts; since your project transcripts are shared across
-  accounts, you can hit a limit, switch, and `claude --resume` to continue the
-  *same work* on another account. Shows 5h/7d usage **and reset times**.
-
-Neither app has a built-in account switcher — this adds both. **No npm required.**
-
-| Switcher | Windows | macOS | Linux |
-|---|:---:|:---:|:---:|
-| Claude Code CLI | ✅ | ✅ | ✅ |
-| Desktop app | ✅ | — | — |
+The desktop app has no built-in account switcher; this adds one. **No npm or
+other dependencies required.** Windows only.
 
 ---
 
 ## Quick start
 
-**Windows** (PowerShell):
+In **PowerShell**:
 
 ```powershell
 # 1. Install (run once)
-irm https://raw.githubusercontent.com/karthiknl0/claude-account-switcher/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/nlimper/claude-account-switcher/main/install.ps1 | iex
 # 2. Open a NEW PowerShell window, then save each account (see "Add your accounts")
 claude-add-account
 # 3. Switch any time
 claude-switch-account
 ```
-
-**macOS / Linux** (Claude Code CLI only — requires [PowerShell](https://aka.ms/powershell)):
-
-```bash
-# 1. Install (run once)
-pwsh -c "irm https://raw.githubusercontent.com/karthiknl0/claude-account-switcher/main/install.ps1 | iex"
-# 2. Reload your shell (or open a new terminal), then save each account
-source ~/.zshrc   # or ~/.bashrc on Linux
-claude-code-add
-# 3. Switch any time
-claude-code-switch
-```
-
-> **Requires:** Windows for the desktop-app switcher. The Claude Code CLI
-> switcher also runs on macOS/Linux with [PowerShell](https://aka.ms/powershell)
-> installed. On macOS the Claude Code login lives in the **Keychain**, so the
-> first read/write may prompt you to *Allow* access.
->
-> Run **`claude-code-doctor`** any time to verify your setup — it prints the
-> detected platform, credential backend, live-login status, and saved accounts.
 
 ---
 
@@ -59,22 +29,17 @@ claude-code-switch
 Open **PowerShell** and run:
 
 ```powershell
-irm https://raw.githubusercontent.com/karthiknl0/claude-account-switcher/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/nlimper/claude-account-switcher/main/install.ps1 | iex
 ```
 
 This installs:
 
-- Scripts in `~/.claude-tools/`
-- PowerShell commands: `claude-add-account`, `claude-switch-account` (desktop app);
-  `claude-code-add`, `claude-code-switch`, `claude-code-doctor` (Claude Code CLI);
+- the scripts in `~/.claude-tools/`
+- the PowerShell commands `claude-add-account`, `claude-switch-account` and
   `claude-switch-update`
-- a **"Claude Switch Account"** shortcut on your Desktop (for the desktop app)
+- a **"Claude Switch Account"** shortcut on your Desktop
 
 **Then open a new PowerShell window** so the commands load.
-
-> Which one do you want? Use the **desktop-app** commands to switch the Claude
-> app's chats. Use the **Claude Code** commands to switch which account your
-> `claude` coding sessions run under (see the Claude Code section below).
 
 ---
 
@@ -92,12 +57,12 @@ This installs:
    claude-add-account
    ```
 
-   - Enter that account's **email** when asked.
-   - Claude briefly closes (to copy its session) and reopens.
+   - It detects which account is logged in and asks you to confirm it.
+   - Claude briefly closes (to copy its profile) and reopens.
 3. When it asks **"Add ANOTHER account now?"** → type **`y`**. Claude reopens at a
    **fresh sign-in screen** (your first account is *not* logged out).
-4. **Sign in as your next account**, run `claude-add-account` again, enter its
-   email. Repeat for as many accounts as you like.
+4. **Sign in as your next account** and run `claude-add-account` again. Repeat
+   for as many accounts as you like.
 5. On the **last** account, answer **`n`** to "Add ANOTHER account?".
 
 ---
@@ -116,49 +81,18 @@ You'll see a menu like:
   [2]   work@example.com          5h  47% / 7d  31% used
         5h resets in 1h02m (18:36)   |   7d resets Fri Jun 5, 09:00
   (* = current   |   lower % = more headroom)
+  Live profile: C:\Users\you\AppData\Roaming\Claude
 ```
 
 Type the **number** and press Enter. Claude closes and reopens logged into that
-account.
+account. A saved account whose snapshot is unusable is shown in red with the
+reason and cannot be picked; sign in to it and run `claude-add-account` again.
 
 > ⚠️ Run it from a **standalone** PowerShell window (or the Desktop shortcut),
 > **not** from inside a Claude session — switching force-closes the desktop app.
 >
-> The **usage readout** (5-hour / 7-day % used) works out of the box - no Node
-> or any other dependency needed. An account whose saved token has expired
-> shows `usage n/a` until you next switch to it.
-
----
-
-## Switching Claude Code (CLI) accounts
-
-The steps above switch the **desktop app**. To switch which account your
-**Claude Code** (`claude`) sessions run under — handy when you hit a usage limit
-mid-task — use the `claude-code-*` commands. Claude Code stores its login in a
-simple credentials file, so this is a fast, safe swap.
-
-**Save each account** (one-time):
-
-1. In Claude Code, `/login` as your first account.
-2. Run `claude-code-add` → enter its email.
-3. Answer **y** to "Add ANOTHER account?" — your login is cleared locally (not
-   logged out), so the saved one stays valid.
-4. `/login` as the next account, run `claude-code-add` again. Repeat; answer
-   **n** on the last.
-
-**Switch + continue your work:**
-
-```powershell
-claude-code-switch     # pick the account (shows usage; * = current)
-claude --resume        # continue the same conversation under the new account
-```
-
-Because your project transcripts live in `~/.claude/projects/` (shared across
-accounts), `claude --resume` picks up exactly where you left off — now billed to
-the account you switched to.
-
-> Close any open Claude Code session before switching so it re-reads the new
-> login.
+> An account whose saved token has expired shows `usage n/a` until you next
+> switch to it.
 
 ---
 
@@ -168,7 +102,7 @@ the account you switched to.
 claude-switch-update
 ```
 
-Pulls the latest version. (You can also just re-run the install one-line.) When a
+Pulls the latest version. (You can also just re-run the install one-liner.) When a
 newer version is available, `claude-switch-account` shows a one-line notice.
 
 ---
@@ -177,16 +111,38 @@ newer version is available, `claude-switch-account` shows a one-line notice.
 
 The Claude desktop app is an Electron app — your login is a **browser session**
 (cookies + Local Storage + IndexedDB), just like being signed into claude.ai in a
-browser. There is no single token file to swap, so the switcher works at the
-session level:
+browser. There is no single token file to swap, so the switcher works on the
+complete app profile:
 
-- `claude-add-account` closes Claude and snapshots the complete app profile into
+- `claude-add-account` closes Claude and saves the complete app profile into
   `~/.claude-accounts/<email>/profile/`.
-- `claude-switch-account` closes Claude, **backs up** the current profile to
-  `~/.claude-accounts/.backup-<timestamp>/profile/` (keeps the last backup),
-  restores the chosen complete profile, and restarts the app.
+- `claude-switch-account` closes Claude, backs up the live profile to
+  `~/.claude-accounts/.backup-<timestamp>/profile/`, saves the live profile back
+  into the account it belongs to, loads the chosen account's profile and
+  restarts the app.
 
-It auto-detects the Store/MSIX app location, so it survives Claude updates.
+**Finding the live profile.** Depending on the version and install type, the app
+keeps its profile in `%APPDATA%\Claude`, in
+`%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude` (Store/MSIX) or in
+`%LOCALAPPDATA%\Claude-Data`. When the app moves its data it leaves the old
+folder behind with a `.user-data-left.*` marker; such folders are skipped. If no
+folder holds a session, the switcher stops instead of guessing.
+
+**Safeguards against losing an account:**
+
+- Every profile is verified (`Local State`, cookies, and a token in
+  `config.json`) before and after each copy. An empty or logged-out profile never
+  overwrites a saved account.
+- The account the live session belongs to is asked from Anthropic's OAuth
+  profile endpoint. If that is not possible (expired token, no network), the
+  switcher falls back to the last switch and asks for confirmation before
+  saving the live session into that account.
+- When an account is saved again, its previous snapshot is kept as
+  `profile.prev` and put back if the new copy does not verify.
+- The last 2 verified backups are kept.
+- Any error during the swap aborts it; if loading the chosen profile fails, the
+  live profile is restored from the backup. After the restart the switcher
+  checks that the app actually uses the profile folder that was written.
 
 There is no live in-app switch — the menu is the "dropdown", and the app reflects
 whichever account's session is active after the restart.
@@ -205,11 +161,11 @@ whichever account's session is active after the restart.
 ## Uninstall
 
 ```powershell
-irm https://raw.githubusercontent.com/karthiknl0/claude-account-switcher/main/uninstall.ps1 | iex
+irm https://raw.githubusercontent.com/nlimper/claude-account-switcher/main/uninstall.ps1 | iex
 ```
 
-Removes the scripts, shortcut, and functions. Leaves your saved accounts alone;
-remove them yourself if you want:
+Removes the scripts, the Desktop shortcut and the commands. Leaves your saved
+accounts alone; remove them yourself if you want:
 
 ```powershell
 Remove-Item -Recurse -Force ~/.claude-accounts
@@ -224,6 +180,9 @@ Remove-Item -Recurse -Force ~/.claude-accounts
 - **Switching closes Claude.** The app must fully quit so its session files
   unlock; the switcher waits for that, then reopens it. Don't run it from inside
   a Claude session you care about.
+- **The whole profile is switched.** Local app data such as settings and local
+  sessions belongs to the profile, so after a switch you see the state of the
+  account you switched to, as it was when you last left it.
 - **Saved sessions are machine-bound.** Cookies are encrypted with a Windows
   (DPAPI) key tied to your user account, so a snapshot only works on the same
   Windows user/machine it was taken on. Don't copy `~/.claude-accounts` to

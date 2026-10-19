@@ -7,7 +7,7 @@
 # app (and any session running inside it).
 
 $store          = Join-Path $env:USERPROFILE '.claude-accounts'
-$RawBase        = 'https://raw.githubusercontent.com/karthiknl0/claude-account-switcher/main'
+$RawBase        = 'https://raw.githubusercontent.com/nlimper/claude-account-switcher/main'
 
 # -- Update check (best-effort, cached once per day) ---------------------------
 function Test-ForUpdate {
