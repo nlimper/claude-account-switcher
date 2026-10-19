@@ -28,8 +28,22 @@ function Test-ForUpdate {
     } catch {}
 }
 
+# Number of complete live-profile backups to keep. An older backup is only
+# removed once a newer one has been verified as a usable profile.
+$KeepBackups    = 2
+
 # -- Resolve the live session root (handles MSIX/Store + plain installs) --------
-function Get-SessionRoot {
+# Claude Desktop has kept its profile in %APPDATA%\Claude (plain install), in
+# the MSIX-virtualised Packages\Claude_*\LocalCache\Roaming\Claude, and in newer
+# builds in %LOCALAPPDATA%\Claude-Data\<package>. When the app moves its data it
+# leaves the old folder behind, empty except for a '.user-data-left.*' marker.
+# Such an abandoned folder must never be read from or written to.
+function Test-AbandonedRoot($dir) {
+    return [bool](Get-ChildItem $dir -Force -Filter '.user-data-left*' -ErrorAction SilentlyContinue |
+        Select-Object -First 1)
+}
+
+function Get-SessionRootCandidates {
     $roots = @( Join-Path $env:APPDATA 'Claude' )
     $pkgRoot = Join-Path $env:LOCALAPPDATA 'Packages'
     if (Test-Path $pkgRoot) {
@@ -37,19 +51,64 @@ function Get-SessionRoot {
             $roots += (Join-Path $_.FullName 'LocalCache\Roaming\Claude')
         }
     }
-    $roots = $roots | Where-Object { Test-Path $_ } | Select-Object -Unique
+    $dataRoot = Join-Path $env:LOCALAPPDATA 'Claude-Data'
+    if (Test-Path $dataRoot) {
+        Get-ChildItem $dataRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $roots += $_.FullName }
+    }
+    return @($roots | Where-Object { (Test-Path $_) -and -not (Test-AbandonedRoot $_) } | Select-Object -Unique)
+}
+
+# The root whose cookie database is locked is the one the running app uses;
+# otherwise the root with the most recently written cookies. $null when no
+# candidate holds a session at all - callers must stop rather than guess.
+function Get-SessionRoot {
     $live = $null; $newest = $null; $newestTime = [datetime]::MinValue
-    foreach ($r in $roots) {
+    foreach ($r in (Get-SessionRootCandidates)) {
         $ck = Join-Path $r 'Network\Cookies'
         if (Test-Path $ck) {
-            try { $fs = [IO.File]::Open($ck,'Open','Read','None'); $fs.Close() } catch { $live = $r }
+            if (Test-FileLocked $ck) { $live = $r }
             $t = (Get-Item $ck).LastWriteTime
             if ($t -gt $newestTime) { $newestTime = $t; $newest = $r }
         }
     }
-    if ($live)   { return $live }
-    if ($newest) { return $newest }
-    return ($roots | Select-Object -First 1)
+    if ($live) { return $live }
+    return $newest
+}
+
+function Test-FileLocked($path) {
+    try { $fs = [IO.File]::Open($path, 'Open', 'Read', 'None'); $fs.Close(); return $false } catch { return $true }
+}
+
+# Returns $null when $dir holds a complete, logged-in Claude profile, otherwise
+# a short reason. Every copy is checked with this before and after, so an empty
+# or abandoned folder can never overwrite a saved account or backup.
+function Test-ClaudeProfile($dir) {
+    if (-not $dir -or -not (Test-Path $dir)) { return 'folder does not exist' }
+    if (Test-AbandonedRoot $dir) { return 'Claude moved its data out of this folder' }
+    foreach ($f in 'Local State', 'Network\Cookies') {
+        if (-not (Test-Path (Join-Path $dir $f))) { return "'$f' is missing" }
+    }
+    $raw = Read-FileShared (Join-Path $dir 'config.json')
+    if (-not $raw) { return "'config.json' is missing or unreadable" }
+    try { $cfg = ConvertFrom-Json $raw -ErrorAction Stop } catch { return "'config.json' is not valid JSON" }
+    if (-not ($cfg.'oauth:tokenCacheV2' -or $cfg.'oauth:tokenCache')) { return 'not logged in (token cache is empty)' }
+    return $null
+}
+
+# Mirror a verified profile into a saved account. The previous snapshot is
+# first kept as '<destination>.prev' (incremental mirror, so cheap after the
+# first time) and put back if the new copy fails verification. Returns $null
+# on success, otherwise the reason it refused or failed.
+function Save-ClaudeProfile($source, $destination) {
+    $why = Test-ClaudeProfile $source
+    if ($why) { return "source $source is not usable: $why" }
+    $prev = "$destination.prev"
+    if (-not (Test-ClaudeProfile $destination)) {
+        if (-not (Copy-ClaudeProfile $destination $prev)) { return "could not keep the previous snapshot in $prev" }
+    }
+    if ((Copy-ClaudeProfile $source $destination) -and -not (Test-ClaudeProfile $destination)) { return $null }
+    if (-not (Test-ClaudeProfile $prev)) { Copy-ClaudeProfile $prev $destination | Out-Null }
+    return "the copy in $destination did not verify; the previous snapshot was put back"
 }
 
 function Stop-Claude($root) {
@@ -174,7 +233,9 @@ function Read-FileShared($path) {
 
 function Get-TokenCacheBlob($root) {
     try {
-        $cfg = Read-FileShared (Join-Path $root 'config.json') | ConvertFrom-Json
+        $raw = Read-FileShared (Join-Path $root 'config.json')
+        if (-not $raw) { return $null }
+        $cfg = ConvertFrom-Json $raw -ErrorAction Stop
         # Claude Desktop's V1 entry can be an empty placeholder. Prefer V2 but
         # retain V1 compatibility for older desktop builds.
         $blob = $cfg.'oauth:tokenCacheV2'
@@ -241,6 +302,45 @@ function Get-UsageFromBlob($blob, $key) {
     return Get-ClaudeUsage $tok
 }
 
+# Email of the account the live profile is ACTUALLY logged into, asked from the
+# OAuth profile endpoint (same check claude-add uses). Returns the email,
+# 'EMPTY' when the token cache holds no token (logged out), or $null when it
+# could not be determined (expired token, network, decrypt failure).
+function Get-LoggedInEmail($root) {
+    $blob = Get-TokenCacheBlob $root
+    if (-not $blob) { return 'EMPTY' }
+    $tok = Get-TokenFromBlob $blob (Get-AesKey $root)
+    if (-not $tok) { return $null }
+    try {
+        if (-not $script:HttpClient) {
+            $handler = New-Object System.Net.Http.HttpClientHandler
+            $script:HttpClient = New-Object System.Net.Http.HttpClient($handler)
+            $script:HttpClient.Timeout = [TimeSpan]::FromSeconds(6)
+        }
+        $req = New-Object System.Net.Http.HttpRequestMessage('GET', 'https://api.anthropic.com/api/oauth/profile')
+        $req.Headers.Add('Authorization', "Bearer $tok")
+        $req.Headers.Add('anthropic-version', '2023-06-01')
+        $req.Headers.Add('anthropic-beta', 'oauth-2025-04-20')
+        $resp = $script:HttpClient.SendAsync($req).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) { return $null }
+        $j = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult() | ConvertFrom-Json
+        if ($j.account.email) { return $j.account.email }
+    } catch {}
+    return $null
+}
+
+# After a relaunch, wait for the app to lock the cookie database in $root. If
+# it never does, the app is reading its profile from somewhere else and the
+# account that was just loaded is not the one it shows.
+function Confirm-ClaudeUsesRoot($root) {
+    $ck = Join-Path $root 'Network\Cookies'
+    for ($i = 0; $i -lt 60; $i++) {
+        if ((Test-Path $ck) -and (Test-FileLocked $ck)) { return $true }
+        Start-Sleep -Milliseconds 500
+    }
+    return $false
+}
+
 # Format the reset times into a short, human line (local time). The 5h limit is
 # close so it's shown as a countdown; the weekly limit is shown as a date+time.
 function Format-Resets($u) {
@@ -278,9 +378,8 @@ foreach ($a in $accounts) {
     try { $m = Get-Content (Join-Path $a.FullName 'meta.json') -Raw | ConvertFrom-Json } catch { continue }
     $profile = Join-Path $a.FullName 'profile'
     if (-not (Test-Path $profile)) { $legacyCount++; continue }
-    $tc = $null
-    $tc = Get-TokenCacheBlob $profile
-    $list += [pscustomobject]@{ Email = $m.email; Dir = $a.FullName; Profile = $profile; Token = $tc }
+    $list += [pscustomobject]@{ Email = $m.email; Dir = $a.FullName; Profile = $profile
+                                Token = (Get-TokenCacheBlob $profile); Problem = (Test-ClaudeProfile $profile) }
 }
 if (-not $list) {
     if ($legacyCount) {
@@ -297,28 +396,48 @@ Write-Host ""
 Write-Host "=== Switch Claude account ===" -ForegroundColor Cyan
 Test-ForUpdate
 
-# Identify the current account (live config token matches a saved one) + fetch usage.
-$liveRoot   = Get-SessionRoot
-$liveToken  = $null
-if ($liveRoot) { $liveToken = Get-TokenCacheBlob $liveRoot }
-# The app rotates its session tokens while it runs, so the live token may no
-# longer match any saved snapshot. Fall back to the marker written on the last
-# switch to still know which saved account the live session belongs to.
-$currentFile = Join-Path $store '.current'
-$currentAcct = $null
-if ($liveToken) { $currentAcct = $list | Where-Object { $_.Token -eq $liveToken } | Select-Object -First 1 }
-if (-not $currentAcct -and (Test-Path $currentFile)) {
-    try {
-        $curEmail    = (Get-Content $currentFile -Raw).Trim()
-        $currentAcct = $list | Where-Object { $_.Email -eq $curEmail } | Select-Object -First 1
-    } catch {}
+$root = Get-SessionRoot
+if (-not $root) {
+    Write-Host "Claude app data not found (no profile with a session in %APPDATA%\Claude," -ForegroundColor Red
+    Write-Host "%LOCALAPPDATA%\Packages\Claude_* or %LOCALAPPDATA%\Claude-Data). Open Claude once, then retry." -ForegroundColor Red
+    Start-Sleep -Seconds 4; return
 }
-if ($currentAcct) { $liveToken = $currentAcct.Token }
-$aesKey = if ($liveRoot) { Get-AesKey $liveRoot } else { $null }
+
+# Identify the account the live session belongs to. Ask the server first: the
+# app rotates its tokens while it runs, so both a token match and the marker
+# written on the last switch can be stale, and syncing the live session into
+# the wrong saved account destroys that account's snapshot.
+$currentFile = Join-Path $store '.current'
+$liveProblem = Test-ClaudeProfile $root
+$liveEmail   = $null
+$currentAcct = $null
+$currentSure = $false
+if (-not $liveProblem) {
+    $liveEmail = Get-LoggedInEmail $root
+    if ($liveEmail -and $liveEmail -ne 'EMPTY') {
+        $currentAcct = $list | Where-Object { $_.Email -eq $liveEmail } | Select-Object -First 1
+        $currentSure = $true
+    } else {
+        $liveEmail = $null
+        $liveToken = Get-TokenCacheBlob $root
+        if ($liveToken) { $currentAcct = $list | Where-Object { $_.Token -eq $liveToken } | Select-Object -First 1 }
+        if (-not $currentAcct -and (Test-Path $currentFile)) {
+            try {
+                $curEmail    = (Get-Content $currentFile -Raw).Trim()
+                $currentAcct = $list | Where-Object { $_.Email -eq $curEmail } | Select-Object -First 1
+            } catch {}
+        }
+    }
+}
+$aesKey = Get-AesKey $root
 Write-Host "Fetching usage..." -ForegroundColor DarkGray
 
 for ($i = 0; $i -lt $list.Count; $i++) {
-    $mark = if ($liveToken -and $list[$i].Token -eq $liveToken) { '*' } else { ' ' }
+    $mark = if ($currentAcct -and $list[$i].Email -eq $currentAcct.Email) { '*' } else { ' ' }
+    if ($list[$i].Problem) {
+        Write-Host ("  [{0}] {1} {2,-32}  snapshot unusable: {3}" -f ($i + 1), $mark, $list[$i].Email, $list[$i].Problem) -ForegroundColor Red
+        continue
+    }
     $u = Get-UsageFromBlob $list[$i].Token $aesKey
     $usageStr = if ($u) { "  5h {0,3}% / 7d {1,3}% used" -f [int]$u.five_hour.utilization, [int]$u.seven_day.utilization } else { "  usage n/a" }
     Write-Host ("  [{0}] {1} {2,-32}{3}" -f ($i + 1), $mark, $list[$i].Email, $usageStr)
@@ -326,6 +445,16 @@ for ($i = 0; $i -lt $list.Count; $i++) {
     if ($resetStr) { Write-Host ("        $resetStr") -ForegroundColor DarkGray }
 }
 Write-Host "  (* = current   |   lower % = more headroom)" -ForegroundColor DarkGray
+Write-Host "  Live profile: $root" -ForegroundColor DarkGray
+if ($liveProblem) {
+    Write-Host "  The live profile is $liveProblem - it will be backed up, not saved to an account." -ForegroundColor Yellow
+} elseif (-not $currentAcct) {
+    $who = if ($liveEmail) { $liveEmail } else { 'an unidentified account' }
+    Write-Host "  The live session ($who) is not a saved account - it will only be kept in the backup." -ForegroundColor Yellow
+    Write-Host "  Run 'claude-add-account' first to keep it switchable." -ForegroundColor Yellow
+} elseif (-not $currentSure) {
+    Write-Host "  Could not verify the live account online; assuming $($currentAcct.Email)." -ForegroundColor Yellow
+}
 Write-Host ""
 $pick = Read-Host "Pick an account number (or Enter to cancel)"
 if ([string]::IsNullOrWhiteSpace($pick)) { Write-Host "Cancelled." -ForegroundColor Yellow; return }
@@ -333,10 +462,21 @@ if ($pick -notmatch '^\d+$' -or [int]$pick -lt 1 -or [int]$pick -gt $list.Count)
     Write-Host "Invalid choice." -ForegroundColor Red; Start-Sleep -Seconds 2; return
 }
 $chosen      = $list[[int]$pick - 1]
-# -- Perform the swap ----------------------------------------------------------
-$root = Get-SessionRoot
-if (-not $root) { Write-Host "Claude app data not found." -ForegroundColor Red; Start-Sleep -Seconds 2; return }
+if ($chosen.Problem) {
+    Write-Host "The saved snapshot for $($chosen.Email) is unusable ($($chosen.Problem))." -ForegroundColor Red
+    Write-Host "Sign in to that account and run 'claude-add-account' to save it again." -ForegroundColor Red
+    Start-Sleep -Seconds 4; return
+}
+if ($currentAcct -and -not $currentSure) {
+    $ans = Read-Host "Save the live session back into $($currentAcct.Email)? [y/N]"
+    if ($ans -notmatch '^(y|yes)$') { $currentAcct = $null }
+}
+if (-not $liveProblem -and -not $currentAcct) {
+    $ans = Read-Host "The live session will only be kept in the backup. Continue? [y/N]"
+    if ($ans -notmatch '^(y|yes)$') { Write-Host "Cancelled." -ForegroundColor Yellow; return }
+}
 
+# -- Perform the swap ----------------------------------------------------------
 Write-Host ""
 Write-Host "Closing Claude..." -ForegroundColor Cyan
 if (-not (Stop-Claude $root)) {
@@ -344,50 +484,66 @@ if (-not (Stop-Claude $root)) {
     Start-Sleep -Seconds 3; return
 }
 
-# Back up the complete live profile so a bad swap is recoverable.
+# Any unexpected error from here on aborts the switch instead of carrying on
+# with a half-done swap.
+$ErrorActionPreference = 'Stop'
 $backup = Join-Path $store ('.backup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
-Write-Host "Backing up current profile..." -ForegroundColor DarkGray
-if (-not (Copy-ClaudeProfile $root (Join-Path $backup 'profile'))) {
-    Write-Host "Could not back up the current profile. Refusing to switch." -ForegroundColor Red
-    Start-Claude
-    Start-Sleep -Seconds 3; return
-}
-
-# Keep only the most recent backup (complete profiles are large).
-Get-ChildItem $store -Directory -Filter '.backup-*' -ErrorAction SilentlyContinue |
-    Sort-Object Name -Descending | Select-Object -Skip 1 |
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-
-# Sync the entire live profile back before loading another account. This keeps
-# every authentication component consistent as Claude changes its storage.
-if ($currentAcct) {
-    Write-Host "Refreshing saved profile for $($currentAcct.Email)..." -ForegroundColor DarkGray
-    if (-not (Copy-ClaudeProfile $root $currentAcct.Profile)) {
-        Write-Host "Could not refresh the current profile. Refusing to switch." -ForegroundColor Red
-        Start-Claude
-        Start-Sleep -Seconds 3; return
-    }
-}
-
-Write-Host "Loading complete profile for $($chosen.Email)..." -ForegroundColor Cyan
-if (-not (Copy-ClaudeProfile $chosen.Profile $root)) {
-    Write-Host "Could not load the selected profile. Restore the backup at $backup if needed." -ForegroundColor Red
-    Start-Sleep -Seconds 3; return
-}
-
-# Remember which saved account the live session now belongs to, so the next
-# sync-back can identify it even after the app rotates its tokens.
 try {
-    [System.IO.File]::WriteAllText((Join-Path $store '.current'), $chosen.Email,
-        (New-Object System.Text.UTF8Encoding($false)))
-} catch {}
+    # Back up the complete live profile so a bad swap is recoverable.
+    Write-Host "Backing up current profile..." -ForegroundColor DarkGray
+    if (-not (Copy-ClaudeProfile $root (Join-Path $backup 'profile'))) {
+        throw "could not back up the live profile to $backup"
+    }
+
+    # Prune old backups (complete profiles are large), counting only verified
+    # ones, so a broken live profile can never push the last good backup out.
+    Get-ChildItem $store -Directory -Filter '.backup-*' -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending |
+        Where-Object { -not (Test-ClaudeProfile (Join-Path $_.FullName 'profile')) } |
+        Select-Object -Skip $KeepBackups |
+        Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
+    # Sync the entire live profile back before loading another account. This keeps
+    # every authentication component consistent as Claude changes its storage.
+    if ($currentAcct) {
+        Write-Host "Refreshing saved profile for $($currentAcct.Email)..." -ForegroundColor DarkGray
+        $err = Save-ClaudeProfile $root $currentAcct.Profile
+        if ($err) { throw "could not refresh the saved profile for $($currentAcct.Email): $err" }
+    }
+
+    Write-Host "Loading complete profile for $($chosen.Email)..." -ForegroundColor Cyan
+    if (-not (Copy-ClaudeProfile $chosen.Profile $root) -or (Test-ClaudeProfile $root)) {
+        Copy-ClaudeProfile (Join-Path $backup 'profile') $root | Out-Null
+        throw "could not load the profile of $($chosen.Email); the previous live profile was put back from $backup"
+    }
+
+    # Remember which saved account the live session now belongs to, as a
+    # fallback for the next switch when the account cannot be verified online.
+    try {
+        [System.IO.File]::WriteAllText($currentFile, $chosen.Email, (New-Object System.Text.UTF8Encoding($false)))
+    } catch {}
+} catch {
+    Write-Host "Switch aborted: $($_.Exception.Message)" -ForegroundColor Red
+    Start-Claude | Out-Null
+    Start-Sleep -Seconds 5; return
+} finally {
+    $ErrorActionPreference = 'Continue'
+}
 
 Write-Host "Reopening Claude..." -ForegroundColor Cyan
-if (Start-Claude) {
+if (-not (Start-Claude)) {
+    Write-Host "Session swapped, but the Claude app wasn't found to relaunch - open it manually." -ForegroundColor Yellow
+    Start-Sleep -Seconds 3; return
+}
+if (Confirm-ClaudeUsesRoot $root) {
     Write-Host ""
     Write-Host "Done - Claude is reopening as $($chosen.Email)." -ForegroundColor Green
     Write-Host "If it still shows the old account, fully quit Claude from the tray and reopen." -ForegroundColor DarkGray
+    Start-Sleep -Seconds 2
 } else {
-    Write-Host "Session swapped, but the Claude app wasn't found to relaunch - open it manually." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "Claude did not open the profile in $root within 30 seconds." -ForegroundColor Red
+    Write-Host "It may keep its data in another folder now; check which account it shows." -ForegroundColor Red
+    Write-Host "The previous live profile is in $backup." -ForegroundColor Red
+    Start-Sleep -Seconds 6
 }
-Start-Sleep -Seconds 2

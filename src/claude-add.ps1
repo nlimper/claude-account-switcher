@@ -15,7 +15,17 @@ Write-Host "2. Then run this - it CLOSES Claude to copy its session, then reopen
 Write-Host ""
 
 # -- Resolve the live session root (handles MSIX/Store + plain installs) --------
-function Get-SessionRoot {
+# Claude Desktop has kept its profile in %APPDATA%\Claude (plain install), in
+# the MSIX-virtualised Packages\Claude_*\LocalCache\Roaming\Claude, and in newer
+# builds in %LOCALAPPDATA%\Claude-Data\<package>. When the app moves its data it
+# leaves the old folder behind, empty except for a '.user-data-left.*' marker.
+# Such an abandoned folder must never be read from or written to.
+function Test-AbandonedRoot($dir) {
+    return [bool](Get-ChildItem $dir -Force -Filter '.user-data-left*' -ErrorAction SilentlyContinue |
+        Select-Object -First 1)
+}
+
+function Get-SessionRootCandidates {
     $roots = @( Join-Path $env:APPDATA 'Claude' )
     $pkgRoot = Join-Path $env:LOCALAPPDATA 'Packages'
     if (Test-Path $pkgRoot) {
@@ -23,19 +33,74 @@ function Get-SessionRoot {
             $roots += (Join-Path $_.FullName 'LocalCache\Roaming\Claude')
         }
     }
-    $roots = $roots | Where-Object { Test-Path $_ } | Select-Object -Unique
+    $dataRoot = Join-Path $env:LOCALAPPDATA 'Claude-Data'
+    if (Test-Path $dataRoot) {
+        Get-ChildItem $dataRoot -Directory -ErrorAction SilentlyContinue | ForEach-Object { $roots += $_.FullName }
+    }
+    return @($roots | Where-Object { (Test-Path $_) -and -not (Test-AbandonedRoot $_) } | Select-Object -Unique)
+}
+
+# The root whose cookie database is locked is the one the running app uses;
+# otherwise the root with the most recently written cookies. $null when no
+# candidate holds a session at all - callers must stop rather than guess.
+function Get-SessionRoot {
     $live = $null; $newest = $null; $newestTime = [datetime]::MinValue
-    foreach ($r in $roots) {
+    foreach ($r in (Get-SessionRootCandidates)) {
         $ck = Join-Path $r 'Network\Cookies'
         if (Test-Path $ck) {
-            try { $fs = [IO.File]::Open($ck,'Open','Read','None'); $fs.Close() } catch { $live = $r }
+            if (Test-FileLocked $ck) { $live = $r }
             $t = (Get-Item $ck).LastWriteTime
             if ($t -gt $newestTime) { $newestTime = $t; $newest = $r }
         }
     }
-    if ($live)   { return $live }
-    if ($newest) { return $newest }
-    return ($roots | Select-Object -First 1)
+    if ($live) { return $live }
+    return $newest
+}
+
+function Test-FileLocked($path) {
+    try { $fs = [IO.File]::Open($path, 'Open', 'Read', 'None'); $fs.Close(); return $false } catch { return $true }
+}
+
+function Read-FileShared($path) {
+    try {
+        $fs     = [System.IO.File]::Open($path, 'Open', 'Read', 'ReadWrite')
+        $reader = New-Object System.IO.StreamReader($fs)
+        $text   = $reader.ReadToEnd()
+        $reader.Close(); $fs.Close()
+        return $text
+    } catch { return $null }
+}
+
+# Returns $null when $dir holds a complete, logged-in Claude profile, otherwise
+# a short reason. Every copy is checked with this before and after, so an empty
+# or abandoned folder can never overwrite a saved account.
+function Test-ClaudeProfile($dir) {
+    if (-not $dir -or -not (Test-Path $dir)) { return 'folder does not exist' }
+    if (Test-AbandonedRoot $dir) { return 'Claude moved its data out of this folder' }
+    foreach ($f in 'Local State', 'Network\Cookies') {
+        if (-not (Test-Path (Join-Path $dir $f))) { return "'$f' is missing" }
+    }
+    $raw = Read-FileShared (Join-Path $dir 'config.json')
+    if (-not $raw) { return "'config.json' is missing or unreadable" }
+    try { $cfg = ConvertFrom-Json $raw -ErrorAction Stop } catch { return "'config.json' is not valid JSON" }
+    if (-not ($cfg.'oauth:tokenCacheV2' -or $cfg.'oauth:tokenCache')) { return 'not logged in (token cache is empty)' }
+    return $null
+}
+
+# Mirror a verified profile into a saved account. The previous snapshot is
+# first kept as '<destination>.prev' (incremental mirror, so cheap after the
+# first time) and put back if the new copy fails verification. Returns $null
+# on success, otherwise the reason it refused or failed.
+function Save-ClaudeProfile($source, $destination) {
+    $why = Test-ClaudeProfile $source
+    if ($why) { return "source $source is not usable: $why" }
+    $prev = "$destination.prev"
+    if (-not (Test-ClaudeProfile $destination)) {
+        if (-not (Copy-ClaudeProfile $destination $prev)) { return "could not keep the previous snapshot in $prev" }
+    }
+    if ((Copy-ClaudeProfile $source $destination) -and -not (Test-ClaudeProfile $destination)) { return $null }
+    if (-not (Test-ClaudeProfile $prev)) { Copy-ClaudeProfile $prev $destination | Out-Null }
+    return "the copy in $destination did not verify; the previous snapshot was put back"
 }
 
 function Stop-Claude($root) {
@@ -209,6 +274,13 @@ if (-not $root) {
     Write-Host "Claude app data not found. Open Claude, log in, then retry." -ForegroundColor Red
     Start-Sleep -Seconds 3; return
 }
+$why = Test-ClaudeProfile $root
+if ($why) {
+    Write-Host "The live Claude profile in $root is not usable: $why." -ForegroundColor Red
+    Write-Host "Log in to Claude first, then run 'claude-add-account' again." -ForegroundColor Red
+    Start-Sleep -Seconds 4; return
+}
+Write-Host "Live profile: $root" -ForegroundColor DarkGray
 
 $detected = Get-LoggedInEmail $root
 if ($detected -eq 'EMPTY') {
@@ -245,10 +317,11 @@ $dest        = Join-Path $store $safe
 $profileDest = Join-Path $dest 'profile'
 
 Write-Host "Saving complete profile for $email ..." -ForegroundColor Cyan
-if (-not (Copy-ClaudeProfile $root $profileDest)) {
-    Write-Host "Could not save the complete Claude profile. No account was changed." -ForegroundColor Red
+$err = Save-ClaudeProfile $root $profileDest
+if ($err) {
+    Write-Host "Could not save the complete Claude profile: $err" -ForegroundColor Red
     Start-Claude
-    Start-Sleep -Seconds 3; return
+    Start-Sleep -Seconds 4; return
 }
 
 [ordered]@{ email = $email; savedAt = (Get-Date -Format o); sourceRoot = $root; profileFormat = 2 } |
