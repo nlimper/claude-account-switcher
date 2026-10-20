@@ -143,6 +143,8 @@ folder holds a session, the switcher stops instead of guessing.
 - Any error during the swap aborts it; if loading the chosen profile fails, the
   live profile is restored from the backup. After the restart the switcher
   checks that the app actually uses the profile folder that was written.
+- A failed copy is logged in `~/.claude-accounts/copy-errors.log`, and an
+  error stays on screen until you press Enter.
 
 There is no live in-app switch — the menu is the "dropdown", and the app reflects
 whichever account's session is active after the restart.
@@ -177,9 +179,12 @@ Remove-Item -Recurse -Force ~/.claude-accounts
 
 - **Use only accounts you own.** This is for moving between your own accounts,
   not sharing accounts or evading limits.
-- **Switching closes Claude.** The app must fully quit so its session files
-  unlock; the switcher waits for that, then reopens it. Don't run it from inside
-  a Claude session you care about.
+- **Switching closes Claude.** The switcher asks the app to quit the way a user
+  does, so the app can stop its Cowork VM; it never kills it. If the app only
+  hides in the system tray, the switcher asks you to quit it from there
+  (right-click → Quit). It then waits until the session files are unlocked and
+  no Cowork VM disk is in use, and stops without changing anything if that does
+  not happen. Don't run it from inside a Claude session you care about.
 - **The whole profile is switched.** Local app data such as settings and local
   sessions belongs to the profile, so after a switch you see the state of the
   account you switched to, as it was when you last left it.

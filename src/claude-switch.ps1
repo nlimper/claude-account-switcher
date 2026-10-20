@@ -111,17 +111,67 @@ function Save-ClaudeProfile($source, $destination) {
     return "the copy in $destination did not verify; the previous snapshot was put back"
 }
 
-function Stop-Claude($root) {
-    Get-Process -Name 'Claude' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    Get-Process -ErrorAction SilentlyContinue |
-        Where-Object { $_.Path -like '*WindowsApps\Claude_*' -or $_.Path -like '*\Claude\Claude.exe' } |
-        Stop-Process -Force -ErrorAction SilentlyContinue
-    $ck = Join-Path $root 'Network\Cookies'
-    for ($i = 0; $i -lt 30; $i++) {
-        if (-not (Test-Path $ck)) { return $true }
-        try { $fs = [IO.File]::Open($ck,'Open','Read','None'); $fs.Close(); return $true } catch { Start-Sleep -Milliseconds 500 }
+# The Claude desktop app's own processes. Claude Code sessions it started run
+# from the profile's claude-code folder and are left to the app to end.
+function Get-ClaudeAppProcesses {
+    return @(Get-Process -Name 'Claude' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Path -like '*WindowsApps\Claude_*' -or $_.Path -like '*\Claude\Claude.exe' })
+}
+
+function Wait-ClaudeExit($seconds) {
+    for ($i = 0; $i -lt $seconds * 2; $i++) {
+        if (-not (Get-ClaudeAppProcesses)) { return $true }
+        Start-Sleep -Milliseconds 500
     }
     return $false
+}
+
+# Disk files of the Cowork VM in this profile that some process still has
+# open. While any is open the VM is running on this profile, sharing its
+# folders, and nothing in the profile may be touched.
+function Get-OpenVmDisks($root) {
+    return @(Get-ChildItem (Join-Path $root 'vm_bundles') -Recurse -File -Filter '*.vhdx' -Force -ErrorAction SilentlyContinue |
+        Where-Object { Test-FileLocked $_.FullName } | ForEach-Object { $_.Name })
+}
+
+# Quit Claude the way a user does, so it stops its Cowork VM and releases the
+# profile. Killing it would leave the VM running: the VM belongs to the
+# CoworkVMService, not to the app. Returns $null once the app has quit, the
+# session files are unlocked and no VM disk is open; otherwise the reason.
+function Stop-Claude($root) {
+    $procs = Get-ClaudeAppProcesses
+    if ($procs) {
+        $procs | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
+            ForEach-Object { $_.CloseMainWindow() | Out-Null }
+        if (-not (Wait-ClaudeExit 15)) {
+            Write-Host "Claude is still running (closing its window may only hide it in the system tray)." -ForegroundColor Yellow
+            Write-Host "Quit it: right-click the Claude icon in the system tray and choose Quit." -ForegroundColor Yellow
+            while (-not (Wait-ClaudeExit 5)) {
+                $ans = Read-Host "Press Enter once Claude has quit, or type c to cancel"
+                if ($ans -match '^c') { return 'Claude is still running' }
+            }
+        }
+    }
+    $ck = Join-Path $root 'Network\Cookies'
+    $unlocked = $false
+    for ($i = 0; $i -lt 30; $i++) {
+        if (-not (Test-Path $ck) -or -not (Test-FileLocked $ck)) { $unlocked = $true; break }
+        Start-Sleep -Milliseconds 500
+    }
+    if (-not $unlocked) { return 'its session files are still locked' }
+    Write-Host "Waiting for the Cowork VM to stop..." -ForegroundColor DarkGray
+    for ($i = 0; $i -lt 60; $i++) {
+        $open = Get-OpenVmDisks $root
+        if (-not $open) { return $null }
+        Start-Sleep -Milliseconds 500
+    }
+    return "the Cowork VM is still running ($($open -join ', ') in use)"
+}
+
+# Keep a failure on screen: the Desktop shortcut's window closes as soon as
+# the script ends.
+function Wait-ForEnter {
+    Read-Host "Press Enter to close" | Out-Null
 }
 
 function Start-Claude {
@@ -132,8 +182,17 @@ function Start-Claude {
 
 function Copy-ClaudeProfile($source, $destination) {
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    robocopy $source $destination /MIR /COPY:DAT /DCOPY:DAT /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS | Out-Null
-    if ($LASTEXITCODE -gt 7) { return $false }
+    $out = robocopy $source $destination /MIR /COPY:DAT /DCOPY:DAT /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS
+    if ($LASTEXITCODE -gt 7) {
+        # Keep robocopy's report, so it shows which file stopped the copy.
+        try {
+            $log = Join-Path $store 'copy-errors.log'
+            $head = "=== {0}  robocopy exit {1}`r`n{2} -> {3}" -f (Get-Date -Format 's'), $LASTEXITCODE, $source, $destination
+            Add-Content -Path $log -Value (@($head) + @($out | Where-Object { $_ -and $_.Trim() }) + '') -Encoding UTF8
+            Write-Host "Copy failed; details in $log" -ForegroundColor Red
+        } catch {}
+        return $false
+    }
 
     Get-ChildItem $destination -Force -Filter 'Singleton*' -ErrorAction SilentlyContinue |
         Remove-Item -Force -ErrorAction SilentlyContinue
@@ -400,7 +459,7 @@ $root = Get-SessionRoot
 if (-not $root) {
     Write-Host "Claude app data not found (no profile with a session in %APPDATA%\Claude," -ForegroundColor Red
     Write-Host "%LOCALAPPDATA%\Packages\Claude_* or %LOCALAPPDATA%\Claude-Data). Open Claude once, then retry." -ForegroundColor Red
-    Start-Sleep -Seconds 4; return
+    Wait-ForEnter; return
 }
 
 # Identify the account the live session belongs to. Ask the server first: the
@@ -466,7 +525,7 @@ $chosen      = $list[[int]$pick - 1]
 if ($chosen.Problem) {
     Write-Host "The saved snapshot for $($chosen.Email) is unusable ($($chosen.Problem))." -ForegroundColor Red
     Write-Host "Sign in to that account and run 'claude-add-account' to save it again." -ForegroundColor Red
-    Start-Sleep -Seconds 4; return
+    Wait-ForEnter; return
 }
 if ($currentAcct -and -not $currentSure) {
     $ans = Read-Host "Save the live session back into $($currentAcct.Email)? [y/N]"
@@ -480,9 +539,10 @@ if (-not $liveProblem -and -not $currentAcct) {
 # -- Perform the swap ----------------------------------------------------------
 Write-Host ""
 Write-Host "Closing Claude..." -ForegroundColor Cyan
-if (-not (Stop-Claude $root)) {
-    Write-Host "Could not fully close Claude (session locked). Close all windows and retry." -ForegroundColor Red
-    Start-Sleep -Seconds 3; return
+$why = Stop-Claude $root
+if ($why) {
+    Write-Host "Could not close Claude cleanly: $why. Nothing was changed." -ForegroundColor Red
+    Wait-ForEnter; return
 }
 
 # Any unexpected error from here on aborts the switch instead of carrying on
@@ -526,7 +586,7 @@ try {
 } catch {
     Write-Host "Switch aborted: $($_.Exception.Message)" -ForegroundColor Red
     Start-Claude | Out-Null
-    Start-Sleep -Seconds 5; return
+    Wait-ForEnter; return
 } finally {
     $ErrorActionPreference = 'Continue'
 }
@@ -534,7 +594,7 @@ try {
 Write-Host "Reopening Claude..." -ForegroundColor Cyan
 if (-not (Start-Claude)) {
     Write-Host "Session swapped, but the Claude app wasn't found to relaunch - open it manually." -ForegroundColor Yellow
-    Start-Sleep -Seconds 3; return
+    Wait-ForEnter; return
 }
 if (Confirm-ClaudeUsesRoot $root) {
     Write-Host ""
@@ -546,5 +606,5 @@ if (Confirm-ClaudeUsesRoot $root) {
     Write-Host "Claude did not open the profile in $root within 30 seconds." -ForegroundColor Red
     Write-Host "It may keep its data in another folder now; check which account it shows." -ForegroundColor Red
     Write-Host "The previous live profile is in $backup." -ForegroundColor Red
-    Start-Sleep -Seconds 6
+    Wait-ForEnter
 }
