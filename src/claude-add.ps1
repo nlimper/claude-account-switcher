@@ -133,9 +133,13 @@ function Get-OpenVmDisks($root) {
 function Stop-Claude($root) {
     $procs = Get-ClaudeAppProcesses
     if ($procs) {
-        $procs | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
-            ForEach-Object { $_.CloseMainWindow() | Out-Null }
-        if (-not (Wait-ClaudeExit 15)) {
+        # Closing the window usually only hides the app in the system tray; an
+        # app that has no window is already there. Either way, ask the user
+        # soon instead of waiting.
+        $windows = @($procs | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+        $windows | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+        $wait = if ($windows) { 5 } else { 1 }
+        if (-not (Wait-ClaudeExit $wait)) {
             Write-Host "Claude is still running (closing its window may only hide it in the system tray)." -ForegroundColor Yellow
             Write-Host "Quit it: right-click the Claude icon in the system tray and choose Quit." -ForegroundColor Yellow
             while (-not (Wait-ClaudeExit 5)) {
@@ -173,7 +177,10 @@ function Start-Claude {
 
 function Copy-ClaudeProfile($source, $destination) {
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    $out = robocopy $source $destination /MIR /COPY:DAT /DCOPY:DAT /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS
+    # '.user-data-*' markers describe the folder (Claude's own bookkeeping for
+    # moving its data), not the account: never copied, and /XF also keeps
+    # robocopy from deleting the ones in the destination.
+    $out = robocopy $source $destination /MIR /COPY:DAT /DCOPY:DAT /XJ /XF '.user-data-*' /R:1 /W:1 /NFL /NDL /NJH /NJS
     if ($LASTEXITCODE -gt 7) {
         # Keep robocopy's report, so it shows which file stopped the copy.
         try {
@@ -194,7 +201,9 @@ function Copy-ClaudeProfile($source, $destination) {
 
 function Clear-ClaudeProfile($root) {
     # The root is the exact app-data directory resolved above, never a parent.
+    # Claude's own '.user-data-*' markers stay: they belong to the folder.
     Get-ChildItem $root -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -notlike '.user-data-*' } |
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
 }
 

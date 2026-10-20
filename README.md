@@ -126,7 +126,9 @@ keeps its profile in `%APPDATA%\Claude`, in
 `%LOCALAPPDATA%\Packages\Claude_*\LocalCache\Roaming\Claude` (Store/MSIX) or in
 `%LOCALAPPDATA%\Claude-Data`. When the app moves its data it leaves the old
 folder behind with a `.user-data-left.*` marker; such folders are skipped. If no
-folder holds a session, the switcher stops instead of guessing.
+folder holds a session, the switcher stops instead of guessing. The
+`.user-data-*` markers belong to the folder, not to an account, so they are
+never copied, overwritten or removed.
 
 **Safeguards against losing an account:**
 
@@ -142,7 +144,8 @@ folder holds a session, the switcher stops instead of guessing.
 - The last 2 verified backups are kept.
 - Any error during the swap aborts it; if loading the chosen profile fails, the
   live profile is restored from the backup. After the restart the switcher
-  checks that the app actually uses the profile folder that was written.
+  finds the profile folder the app actually runs from (Claude may move its data
+  while starting) and checks online that it holds the chosen account.
 - A failed copy is logged in `~/.claude-accounts/copy-errors.log`, and an
   error stays on screen until you press Enter.
 

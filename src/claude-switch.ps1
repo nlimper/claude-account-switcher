@@ -141,9 +141,13 @@ function Get-OpenVmDisks($root) {
 function Stop-Claude($root) {
     $procs = Get-ClaudeAppProcesses
     if ($procs) {
-        $procs | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero } |
-            ForEach-Object { $_.CloseMainWindow() | Out-Null }
-        if (-not (Wait-ClaudeExit 15)) {
+        # Closing the window usually only hides the app in the system tray; an
+        # app that has no window is already there. Either way, ask the user
+        # soon instead of waiting.
+        $windows = @($procs | Where-Object { $_.MainWindowHandle -ne [IntPtr]::Zero })
+        $windows | ForEach-Object { $_.CloseMainWindow() | Out-Null }
+        $wait = if ($windows) { 5 } else { 1 }
+        if (-not (Wait-ClaudeExit $wait)) {
             Write-Host "Claude is still running (closing its window may only hide it in the system tray)." -ForegroundColor Yellow
             Write-Host "Quit it: right-click the Claude icon in the system tray and choose Quit." -ForegroundColor Yellow
             while (-not (Wait-ClaudeExit 5)) {
@@ -182,7 +186,10 @@ function Start-Claude {
 
 function Copy-ClaudeProfile($source, $destination) {
     New-Item -ItemType Directory -Force -Path $destination | Out-Null
-    $out = robocopy $source $destination /MIR /COPY:DAT /DCOPY:DAT /XJ /R:1 /W:1 /NFL /NDL /NJH /NJS
+    # '.user-data-*' markers describe the folder (Claude's own bookkeeping for
+    # moving its data), not the account: never copied, and /XF also keeps
+    # robocopy from deleting the ones in the destination.
+    $out = robocopy $source $destination /MIR /COPY:DAT /DCOPY:DAT /XJ /XF '.user-data-*' /R:1 /W:1 /NFL /NDL /NJH /NJS
     if ($LASTEXITCODE -gt 7) {
         # Keep robocopy's report, so it shows which file stopped the copy.
         try {
@@ -388,16 +395,19 @@ function Get-LoggedInEmail($root) {
     return $null
 }
 
-# After a relaunch, wait for the app to lock the cookie database in $root. If
-# it never does, the app is reading its profile from somewhere else and the
-# account that was just loaded is not the one it shows.
-function Confirm-ClaudeUsesRoot($root) {
-    $ck = Join-Path $root 'Network\Cookies'
+# After a relaunch, the profile folder the app actually runs from: the one
+# whose cookie database it locks. Claude may move its data to another folder
+# while it starts, so all candidates are checked, not only the one that was
+# written. $null when the app locks none of them within 30 seconds.
+function Find-RunningProfile {
     for ($i = 0; $i -lt 60; $i++) {
-        if ((Test-Path $ck) -and (Test-FileLocked $ck)) { return $true }
+        foreach ($r in (Get-SessionRootCandidates)) {
+            $ck = Join-Path $r 'Network\Cookies'
+            if ((Test-Path $ck) -and (Test-FileLocked $ck)) { return $r }
+        }
         Start-Sleep -Milliseconds 500
     }
-    return $false
+    return $null
 }
 
 # Format the reset times into a short, human line (local time). The 5h limit is
@@ -596,15 +606,27 @@ if (-not (Start-Claude)) {
     Write-Host "Session swapped, but the Claude app wasn't found to relaunch - open it manually." -ForegroundColor Yellow
     Wait-ForEnter; return
 }
-if (Confirm-ClaudeUsesRoot $root) {
-    Write-Host ""
-    Write-Host "Done - Claude is reopening as $($chosen.Email)." -ForegroundColor Green
-    Write-Host "If it still shows the old account, fully quit Claude from the tray and reopen." -ForegroundColor DarkGray
-    Start-Sleep -Seconds 2
-} else {
-    Write-Host ""
-    Write-Host "Claude did not open the profile in $root within 30 seconds." -ForegroundColor Red
-    Write-Host "It may keep its data in another folder now; check which account it shows." -ForegroundColor Red
+# Check which account the running app actually has, wherever it keeps its data.
+$running = Find-RunningProfile
+Write-Host ""
+if (-not $running) {
+    Write-Host "Claude did not open a profile within 30 seconds; check which account it shows." -ForegroundColor Red
     Write-Host "The previous live profile is in $backup." -ForegroundColor Red
+    Wait-ForEnter; return
+}
+if ($running -ne $root) {
+    Write-Host "Claude moved its data to $running while starting." -ForegroundColor DarkGray
+}
+$runningEmail = Get-LoggedInEmail $running
+if ($runningEmail -eq $chosen.Email) {
+    Write-Host "Done - Claude is running as $($chosen.Email)." -ForegroundColor Green
+    Start-Sleep -Seconds 2
+} elseif ($runningEmail -and $runningEmail -ne 'EMPTY') {
+    Write-Host "Claude is running as $runningEmail, not as $($chosen.Email)." -ForegroundColor Red
+    Write-Host "The previous live profile is in $backup." -ForegroundColor Red
+    Wait-ForEnter
+} else {
+    Write-Host "Claude is running, but its account could not be verified online." -ForegroundColor Yellow
+    Write-Host "Check that it shows $($chosen.Email)." -ForegroundColor Yellow
     Wait-ForEnter
 }
